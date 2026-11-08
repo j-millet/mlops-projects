@@ -1,0 +1,5 @@
+mlflow.db
+data/*
+mlruns/*
+lightning_logs/*
+*__pycache__*
