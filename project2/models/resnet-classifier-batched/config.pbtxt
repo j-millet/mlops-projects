@@ -1,7 +1,4 @@
 name: "resnet-classifier-batched"
 backend: "onnxruntime"
-max_batch_size : 32
-dynamic_batching {
-    preferred_batch_size: 16
-    max_queue_delay_microseconds: 100
-}
+max_batch_size : 4
+dynamic_batching { }

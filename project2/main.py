@@ -2,6 +2,7 @@ import os
 import platform
 import subprocess
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -12,17 +13,14 @@ import tritonclient.http as httpclient
 MODEL_NAME_UNBATCHED = "resnet-classifier"
 MODEL_NAME_BATCHED = "resnet-classifier-batched"
 URL = "localhost:8000"
+METRICS_URL = os.environ.get("TRITON_METRICS_URL", "http://localhost:8002/metrics")
 
-CONCURRENT_CLIENTS = (1, 8, 32)
+CONCURRENT_CLIENTS = (1, 16, 32)
 MEASURE_SECONDS = 60.0
 WARMUP_REQUESTS = 320
 REPEAT_COUNT = 3
-WARMUP_CLIENTS = 32
-BATCHING_PARAMETERS = (
-    "batched: max_batch_size=32, preferred_batch_size=16, "
-    "max_queue_delay_microseconds=100; "
-    "unbatched: max_batch_size=32, dynamic_batching=disabled"
-)
+WARMUP_CLIENTS = 16
+BATCHING_PARAMETERS = "batched: max_batch_size=4, dynamic_batching=enabled; unbatched: max_batch_size=1, dynamic_batching=disabled"
 
 
 def prepare_input() -> np.ndarray:
@@ -57,6 +55,51 @@ def warm_up(model_name: str, input_data: np.ndarray) -> None:
         list(executor.map(send_requests, range(WARMUP_CLIENTS)))
 
 
+def get_triton_metric_counters(model_name: str) -> dict[str, float]:
+    with urllib.request.urlopen(METRICS_URL, timeout=5) as response:
+        metrics = response.read().decode("utf-8")
+
+    counters = {
+        "nv_inference_count": 0.0,
+        "nv_inference_exec_count": 0.0,
+    }
+    found = set()
+
+    for line in metrics.splitlines():
+        if not line or line.startswith("#"):
+            continue
+
+        name_and_labels, separator, value_text = line.partition(" ")
+        if not separator:
+            continue
+
+        metric_name = name_and_labels.split("{", 1)[0]
+        if metric_name not in counters:
+            continue
+
+        matches_model = True
+        if "{" in name_and_labels:
+            label_text = name_and_labels.split("{", 1)[1].rstrip("}")
+            labels = {}
+            for label in label_text.split(","):
+                key, separator, value = label.strip().partition("=")
+                if separator:
+                    labels[key] = value.strip('"')
+            matches_model = labels.get("model") == model_name
+
+        if matches_model:
+            try:
+                counters[metric_name] += float(value_text)
+                found.add(metric_name)
+            except ValueError:
+                continue
+
+    missing = set(counters) - found
+    if missing:
+        raise RuntimeError(f"Triton metrics missing for {model_name}: {', '.join(sorted(missing))}")
+    return counters
+
+
 def client_loop(
     model_name: str,
     end_time: float,
@@ -75,21 +118,29 @@ def measure(
     concurrency: int,
 ) -> dict[str, float | int | str]:
     time.sleep(1)
+    metrics_before = get_triton_metric_counters(model_name)
     end_time = time.perf_counter() + MEASURE_SECONDS
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [executor.submit(client_loop, model_name, end_time) for _ in range(concurrency)]
         request_results = [item for future in futures for item in future.result()]
+    metrics_after = get_triton_metric_counters(model_name)
 
     completed_in_window = [latency for latency, completed_at in request_results if completed_at <= end_time]
     completed_count = len(completed_in_window)
     throughput = completed_count / MEASURE_SECONDS
     latencies_ms = np.asarray(completed_in_window, dtype=np.float64) * 1000.0
+    inference_count_delta = metrics_after["nv_inference_count"] - metrics_before["nv_inference_count"]
+    exec_count_delta = metrics_after["nv_inference_exec_count"] - metrics_before["nv_inference_exec_count"]
+    average_batch_size = inference_count_delta / exec_count_delta if exec_count_delta > 0 else 0.0
 
     return {
         "model_name": model_name,
         "concurrency": concurrency,
         "completed_samples": completed_count,
         "throughput_samples_per_s": throughput,
+        "triton_inference_count": inference_count_delta,
+        "triton_exec_count": exec_count_delta,
+        "average_batch_size": average_batch_size,
         "p50_ms": float(np.percentile(latencies_ms, 50)),
         "p95_ms": float(np.percentile(latencies_ms, 95)),
         "p99_ms": float(np.percentile(latencies_ms, 99)),
@@ -153,6 +204,8 @@ def run_tests() -> pd.DataFrame:
         .agg(
             throughput_mean=("throughput_samples_per_s", "mean"),
             throughput_std=("throughput_samples_per_s", "std"),
+            batch_size_mean=("average_batch_size", "mean"),
+            batch_size_std=("average_batch_size", "std"),
             p50_mean=("p50_ms", "mean"),
             p50_std=("p50_ms", "std"),
             p95_mean=("p95_ms", "mean"),
@@ -187,6 +240,9 @@ def run_tests() -> pd.DataFrame:
         ]
         table[f"p95 latency {batching} [ms]"] = [
             f"{row['p95_mean']:.2f} +/- {row['p95_std']:.2f}" for row in (subset.loc[level] for level in CONCURRENT_CLIENTS)
+        ]
+        table[f"Avg batch size {batching}"] = [
+            f"{row['batch_size_mean']:.2f} +/- {row['batch_size_std']:.2f}" for row in (subset.loc[level] for level in CONCURRENT_CLIENTS)
         ]
 
     print("\nSaved repeated run data to benchmark_runs.csv")
